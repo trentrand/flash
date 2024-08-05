@@ -1,20 +1,18 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { FastbootDevice, setDebugLevel as setFastbootDebugLevel } from 'android-fastboot'
 
-import { FastbootDevice, setDebugLevel } from 'android-fastboot'
 import * as Comlink from 'comlink'
 
-import config from '@/config'
-import { download } from '@/utils/blob'
-import { useImageWorker } from '@/utils/image'
-import { createManifest } from '@/utils/manifest'
-import { withProgress } from '@/utils/progress'
+import config from '$lib/config'
+import { download } from '$lib/blob'
+import { getWorkerInstance } from '$lib/imageWorker.svelte'
+import { createManifest } from '$lib/manifest'
+import { withProgress } from '$lib/progress'
 
 /**
  * @typedef {import('./manifest.js').Image} Image
  */
 
-// Verbose logging for fastboot
-setDebugLevel(2)
+setFastbootDebugLevel(2)
 
 export const Step = {
   READY: 0,
@@ -86,109 +84,108 @@ function isRecognizedDevice(deviceInfo) {
 }
 
 export function useFastboot() {
-  const [step, setStep] = useState(Step.READY)
-  const [message, _setMessage] = useState('')
-  const [progress, setProgress] = useState(-1)
-  const [error, setError] = useState(Error.NONE)
-  const [isInitialized, setIsInitialized] = useState(false)
+  let step = $state(Step.READY)
+  let message = $state('')
+  let progress = $state(-1)
+  let error = $state(Error.NONE)
+  let isInitialized = $state(false)
 
-  const [connected, setConnected] = useState(false)
-  const [serial, setSerial] = useState(null)
+  let connected = $state(false)
+  let serial = $state(null)
 
-  const [onRetry, setOnRetry] = useState(null)
+  let onRetry = $state(null)
 
-  const imageWorker = useImageWorker()
-  const fastboot = useRef(new FastbootDevice())
+  const fastboot = new FastbootDevice()
 
-  /** @type {React.RefObject<Image[]>} */
-  const manifest = useRef(null)
+  let manifest = $state(null)
 
-  const initializePromise = useRef(null)
+  let initializePromise = null;
 
-  function setMessage(message = '') {
-    if (message) console.info('[fastboot]', message)
-    _setMessage(message)
-  }
+  $inspect(message).with((msg) => console.info('[fastboot]', msg));
 
-  const initialize = useCallback(async () => {
+  const imageWorker = getWorkerInstance()
+
+  const initialize = async () => {
     if (isInitialized) return true
 
-    if (initializePromise.current) return initializePromise.current
+    if (initializePromise) return initializePromise
 
-    initializePromise.current = (async () => {
+    initializePromise = (async () => {
       // Check browser support
       if (typeof navigator.usb === 'undefined') {
         console.error('[fastboot] WebUSB not supported')
-        setError(Error.REQUIREMENTS_NOT_MET)
+        error = Error.REQUIREMENTS_NOT_MET
         return false
       }
 
       if (typeof Worker === 'undefined') {
         console.error('[fastboot] Web Workers not supported')
-        setError(Error.REQUIREMENTS_NOT_MET)
+        error = Error.REQUIREMENTS_NOT_MET
         return false
       }
 
       if (typeof Storage === 'undefined') {
         console.error('[fastboot] Storage API not supported')
-        setError(Error.REQUIREMENTS_NOT_MET)
+        error = Error.REQUIREMENTS_NOT_MET
         return false
       }
 
-      if (!imageWorker.current) {
+      if (!imageWorker) {
         console.debug('[fastboot] Waiting for image worker')
         return false
       }
 
       try {
-        await imageWorker.current?.init()
+        await imageWorker?.init()
         const blob = await download(config.manifests['master'])
         const text = await blob.text()
-        manifest.current = createManifest(text)
+        manifest = createManifest(text)
 
-        if (manifest.current.length === 0) {
+        if (manifest.length === 0) {
           throw new Error('Manifest is empty')
         }
 
-        console.debug('[fastboot] Loaded manifest', manifest.current)
-        setIsInitialized(true)
+        console.debug('[fastboot] Loaded manifest', manifest)
+        isInitialized = true
         return true
       } catch (err) {
         console.error('[fastboot] Initialization error', err)
-        setError(Error.UNKNOWN)
+        error = Error.UNKNOWN
         return false
       } finally {
-        initializePromise.current = null
+        initializePromise = null
       }
     })()
 
-    return initializePromise.current
-  }, [imageWorker, isInitialized])
+    return initializePromise
+  }
 
-  useEffect(() => {
+  $effect(() => {
     initialize()
-  }, [initialize])
+  })
 
   // wait for user interaction (we can't use WebUSB without user event)
-  const handleContinue = useCallback(async () => {
-    const shouldContinue = await initialize()
-    if (!shouldContinue || error !== Error.NONE) return
+  const handleContinue = async () => {
+    if (!isInitialized) {
+      await initialize();
+    }
+    if (error !== Error.NONE) return
 
-    setStep(Step.CONNECTING)
-  }, [initialize])
+    step = Step.CONNECTING
+  }
 
-  useEffect(() => {
-    setProgress(-1)
-    setMessage()
+  $effect(() => {
+    progress = -1
+    message = ''
 
     if (error) return
 
     switch (step) {
       case Step.CONNECTING: {
-        fastboot.current.waitForConnect()
+        fastboot.waitForConnect()
           .then(() => {
-            console.info('[fastboot] Connected', { fastboot: fastboot.current })
-            return fastboot.current.getVariable('all')
+            console.info('[fastboot] Connected', { fastboot })
+            return fastboot.getVariable('all')
               .then((all) => {
                 const deviceInfo = all.split('\n').reduce((obj, line) => {
                   const parts = line.split(':')
@@ -201,169 +198,167 @@ export function useFastboot() {
                 console.debug('[fastboot] Device info', { recognized, deviceInfo })
 
                 if (!recognized) {
-                  setError(Error.UNRECOGNIZED_DEVICE)
+                  error = Error.UNRECOGNIZED_DEVICE
                   return
                 }
 
-                setSerial(deviceInfo['serialno'] || 'unknown')
-                setConnected(true)
-                setStep(Step.DOWNLOADING)
+                serial = deviceInfo['serialno'] || 'unknown'
+                connected = true
+                step = Step.DOWNLOADING
               })
               .catch((err) => {
                 console.error('[fastboot] Error getting device information', err)
-                setError(Error.UNKNOWN)
+                error = Error.UNKNOWN
               })
           })
           .catch((err) => {
             console.error('[fastboot] Connection lost', err)
-            setError(Error.LOST_CONNECTION)
-            setConnected(false)
+            error = Error.LOST_CONNECTION
+            connected = false
           })
 
-        fastboot.current.connect()
+        fastboot.connect()
           .catch((err) => {
             console.error('[fastboot] Connection error', err)
-            setStep(Step.READY)
+            step = Step.READY
           })
         break
       }
 
       case Step.DOWNLOADING: {
-        setProgress(0)
+        progress = 0
 
         async function downloadImages() {
-          for await (const [image, onProgress] of withProgress(manifest.current, setProgress)) {
-            setMessage(`Downloading ${image.name}`)
-            await imageWorker.current.downloadImage(image, Comlink.proxy(onProgress))
+          for await (const [image, onProgress] of withProgress(manifest, progress)) {
+            message = `Downloading ${image.name}`
+            await imageWorker.downloadImage(image, Comlink.proxy(onProgress))
           }
         }
 
         downloadImages()
           .then(() => {
             console.debug('[fastboot] Downloaded all images')
-            setStep(Step.UNPACKING)
+            step = Step.UNPACKING
           })
           .catch((err) => {
             console.error('[fastboot] Download error', err)
-            setError(Error.DOWNLOAD_FAILED)
+            error = Error.DOWNLOAD_FAILED
           })
         break
       }
 
       case Step.UNPACKING: {
-        setProgress(0)
+        progress = 0
 
         async function unpackImages() {
-          for await (const [image, onProgress] of withProgress(manifest.current, setProgress)) {
-            setMessage(`Unpacking ${image.name}`)
-            await imageWorker.current.unpackImage(image, Comlink.proxy(onProgress))
+          for await (const [image, onProgress] of withProgress(manifest, progress)) {
+            message = `Unpacking ${image.name}`
+            await imageWorker.unpackImage(image, Comlink.proxy(onProgress))
           }
         }
 
         unpackImages()
           .then(() => {
             console.debug('[fastboot] Unpacked all images')
-            setStep(Step.FLASHING)
+            step = Step.FLASHING
           })
           .catch((err) => {
             console.error('[fastboot] Unpack error', err)
             if (err.startsWith('Checksum mismatch')) {
-              setError(Error.CHECKSUM_MISMATCH)
+              error = Error.CHECKSUM_MISMATCH
             } else {
-              setError(Error.UNPACK_FAILED)
+              error = Error.UNPACK_FAILED
             }
           })
         break
       }
 
       case Step.FLASHING: {
-        setProgress(0)
+        progress = 0
 
         async function flashDevice() {
-          const currentSlot = await fastboot.current.getVariable('current-slot')
+          const currentSlot = await fastboot.getVariable('current-slot')
           if (!['a', 'b'].includes(currentSlot)) {
             throw `Unknown current slot ${currentSlot}`
           }
 
-          for await (const [image, onProgress] of withProgress(manifest.current, setProgress)) {
-            const fileHandle = await imageWorker.current.getImage(image)
+          for await (const [image, onProgress] of withProgress(manifest, progress)) {
+            const fileHandle = await imageWorker.getImage(image)
             const blob = await fileHandle.getFile()
 
             if (image.sparse) {
-              setMessage(`Erasing ${image.name}`)
-              await fastboot.current.runCommand(`erase:${image.name}`)
+              message = `Erasing ${image.name}`
+              await fastboot.runCommand(`erase:${image.name}`)
             }
-            setMessage(`Flashing ${image.name}`)
-            await fastboot.current.flashBlob(image.name, blob, onProgress, 'other')
+            message = `Flashing ${image.name}`
+            await fastboot.flashBlob(image.name, blob, onProgress, 'other')
           }
           console.debug('[fastboot] Flashed all partitions')
 
           const otherSlot = currentSlot === 'a' ? 'b' : 'a'
-          setMessage(`Changing slot to ${otherSlot}`)
-          await fastboot.current.runCommand(`set_active:${otherSlot}`)
+          message = `Changing slot to ${otherSlot}`
+          await fastboot.runCommand(`set_active:${otherSlot}`)
         }
 
         flashDevice()
           .then(() => {
             console.debug('[fastboot] Flash complete')
-            setStep(Step.ERASING)
+            step = Step.ERASING
           })
           .catch((err) => {
             console.error('[fastboot] Flashing error', err)
-            setError(Error.FLASH_FAILED)
+            error = Error.FLASH_FAILED
           })
         break
       }
 
       case Step.ERASING: {
-        setProgress(0)
+        progress = 0
 
         async function eraseDevice() {
-          setMessage('Erasing userdata')
-          await fastboot.current.runCommand('erase:userdata')
-          setProgress(0.9)
+          message = 'Erasing userdata'
+          await fastboot.runCommand('erase:userdata')
+          progress = 0.9
 
-          setMessage('Rebooting')
-          await fastboot.current.runCommand('continue')
-          setProgress(1)
-          setConnected(false)
+          message = 'Rebooting'
+          await fastboot.runCommand('continue')
+          progress = 1
+          connected = false
         }
 
         eraseDevice()
           .then(() => {
             console.debug('[fastboot] Erase complete')
-            setStep(Step.DONE)
+            step = Step.DONE
           })
           .catch((err) => {
             console.error('[fastboot] Erase error', err)
-            setError(Error.ERASE_FAILED)
+            error = Error.ERASE_FAILED
           })
         break
       }
     }
-  }, [error, imageWorker, step])
+  })
 
-  useEffect(() => {
+  $effect(() => {
     if (error !== Error.NONE) {
       console.debug('[fastboot] error', error)
-      setProgress(-1)
+      progress = -1
 
-      setOnRetry(() => () => {
+      onRetry = () => {
         console.debug('[fastboot] on retry')
         window.location.reload()
-      })
+      }
     }
-  }, [error])
+  })
 
   return {
     step,
     message,
     progress,
     error,
-
     connected,
     serial,
-
     onContinue: handleContinue,
     onRetry,
   }
